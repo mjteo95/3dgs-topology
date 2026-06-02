@@ -1,0 +1,1126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Topologically-constrained multi-3DGS navigator</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body   { background: #000; color: #dde8ff; font-family: 'Courier New', monospace; overflow: hidden; }
+  #cv    { position: fixed; inset: 0; z-index: 0; }
+
+  /* ── Controls overlay ── */
+  #ctrl {
+    position: fixed; top: 14px; left: 14px; z-index: 50;
+    display: flex; flex-direction: column; gap: 7px;
+    pointer-events: none;
+  }
+  .btn {
+    pointer-events: all; cursor: pointer; user-select: none;
+    padding: 7px 14px; font: 11px/1 'Courier New', monospace;
+    background: rgba(8,10,22,0.84); color: #b8ceff;
+    border: 1px solid rgba(100,140,255,0.28); border-radius: 3px;
+    white-space: nowrap;
+    transition: background .12s, border-color .12s, color .12s;
+  }
+  .btn:hover { background: rgba(24,36,80,.92); border-color: rgba(140,180,255,.55); }
+  .btn.on    { color: #66ccff; border-color: #3399dd; }
+
+  /* ── HUD ── */
+  #hud {
+    position: fixed; bottom: 14px; left: 14px; z-index: 50;
+    font-size: 10px; color: rgba(180,200,255,0.50);
+    line-height: 1.75; pointer-events: none;
+  }
+
+  /* ── Minimap ── */
+  #mm {
+    position: fixed; right: 14px; bottom: 14px; z-index: 50;
+    width: 280px; height: 210px;
+    background: rgba(6,8,18,0.90);
+    border: 1px solid rgba(90,120,255,0.22); border-radius: 5px;
+    overflow: hidden;
+  }
+  #mm canvas  { position: absolute; top: 0; left: 0; }
+  #mm-lbl     {
+    position: absolute; top: 5px; left: 9px; z-index: 2;
+    font-size: 9px; color: rgba(160,185,255,0.38);
+    pointer-events: none;
+  }
+
+  /* ── Fade ── */
+  #fade {
+    position: fixed; inset: 0; z-index: 200;
+    background: #000; opacity: 0; pointer-events: none;
+    transition: opacity 0.12s ease;
+  }
+
+  /* ── Loading ── */
+  #loading {
+    position: fixed; inset: 0; z-index: 300;
+    background: #000;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 18px;
+  }
+  #loading h1  { font-size: 20px; letter-spacing: 5px; color: #7ab4ff; font-weight: normal; }
+  #loading p   { font-size: 11px; color: rgba(180,200,255,0.45); letter-spacing: 1px; }
+  .spinner {
+    width: 28px; height: 28px;
+    border: 2px solid rgba(100,150,255,0.2);
+    border-top-color: #5599ff;
+    border-radius: 50%;
+    animation: spin .7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<div id="loading">
+  <h1>INDOOR 3DGS</h1>
+  <div class="spinner"></div>
+  <p id="loading-msg">Initialising…</p>
+</div>
+
+<div id="fade"></div>
+<div id="cv"></div>
+
+<div id="ctrl">
+  <button class="btn"    id="btn-outlines">Geometry Outlines</button>
+  <button class="btn on" id="btn-splat"   >Splat Visible</button>
+  <button class="btn"    id="btn-all-splats">Show All Splats</button>
+  <button class="btn on" id="btn-lock"    >Constraints ON</button>
+</div>
+
+<div id="hud">
+  <div id="hud-fps"  style="font-size:12px;color:#88ccff;margin-bottom:3px;">FPS: —</div>
+  <div id="hud-room">Room: —</div>
+  <div id="hud-pos" >Position: —</div>
+  <div id="hud-fp"  >Floor-plan: —</div>
+  <div style="margin-top:4px;opacity:.6">
+    WASD: move &nbsp;·&nbsp; Space/Shift: up/down &nbsp;·&nbsp; left click and drag: look &nbsp;·&nbsp; click minimap to teleport
+  </div>
+</div>
+
+<div id="mm">
+  <span id="mm-lbl">FLOOR PLAN  (click to teleport)</span>
+  <canvas id="mm-cv" width="280" height="210"></canvas>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+// ══════════════════════════════════════════════════════════
+//  CONSTANTS
+// ══════════════════════════════════════════════════════════
+const ROOM_INSET_M = 0.30;   // inward buffer for GeneralSpace / TransitionSpace
+const DOOR_OUT_M   = 0.60;   // outward buffer for ConnectionSpace (net 0.30 m intrusion)
+const EYE_H        = 1.65;
+const MOVE_SPD     = 2.5;
+
+const SPLAT_TYPES = new Set(['GeneralSpace', 'TransitionSpace']);
+
+// ══════════════════════════════════════════════════════════
+//  DOM
+// ══════════════════════════════════════════════════════════
+const $loading    = document.getElementById('loading');
+const $loadingMsg = document.getElementById('loading-msg');
+const $fade       = document.getElementById('fade');
+const $cv         = document.getElementById('cv');
+const $mmCv       = document.getElementById('mm-cv');
+const $hudFPS     = document.getElementById('hud-fps');
+const $hudRoom    = document.getElementById('hud-room');
+const $hudPos     = document.getElementById('hud-pos');
+const $hudFP      = document.getElementById('hud-fp');
+const $btnOutlines = document.getElementById('btn-outlines');
+const $btnSplat    = document.getElementById('btn-splat');
+const $btnAllSplats = document.getElementById('btn-all-splats');
+const $btnLock     = document.getElementById('btn-lock');
+
+// ══════════════════════════════════════════════════════════
+//  SCENE DATA
+// ══════════════════════════════════════════════════════════
+let roomById  = {};   // id → room row
+let stateById = {};   // id → state row
+// doorRoomMap  : doorId  → [splatRoomId, splatRoomId]
+// roomToDoors  : splatRoomId → [doorId, ...]
+const doorRoomMap = {};
+const roomToDoors = {};
+// roomGeom[id] = { raw:[{x,y}], buffered:[{x,y}], height:m }
+const roomGeom = {};
+
+// ══════════════════════════════════════════════════════════
+//  THREE.JS SETUP
+// ══════════════════════════════════════════════════════════
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+$cv.appendChild(renderer.domElement);
+
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.005, 2000);
+camera.up.set(0, 1, 0);
+
+// ── Mouse-look (replaces OrbitControls) ──────────────────────────
+// Left-click drag: yaw (horizontal) + pitch (vertical) in place.
+// No camera translation — only quaternion rotation.
+const LOOK_SPEED = 0.0025; 
+const PITCH_LIMIT = Math.PI / 2.2;  // prevents full flip
+
+let _isLooking = false;
+let _lookPrevX = 0, _lookPrevY = 0;
+let _pitch = 0;                // track accumulated pitch for clamping
+const _lookTarget = new THREE.Vector3();  // 1 m ahead, used by WASD sync
+
+renderer.domElement.addEventListener('mousedown', e => {
+    if (e.button === 0) {
+        _isLooking = true;
+        _lookPrevX = e.clientX;
+        _lookPrevY = e.clientY;
+        e.preventDefault();
+    }
+});
+window.addEventListener('mouseup',   e => { if (e.button === 0) _isLooking = false; });
+window.addEventListener('mousemove', e => {
+    if (!_isLooking) return;
+    const dx = e.clientX - _lookPrevX;
+    const dy = e.clientY - _lookPrevY;
+    _lookPrevX = e.clientX;
+    _lookPrevY = e.clientY;
+
+    const up = roomUp(currentRoomId);
+
+    // Yaw around room up-axis (no position change)
+    const yawQ = new THREE.Quaternion().setFromAxisAngle(up, -dx * LOOK_SPEED);
+    camera.quaternion.premultiply(yawQ);
+
+    // Pitch around camera's local right-axis, clamped
+    const newPitch = _pitch - dy * LOOK_SPEED;
+    if (Math.abs(newPitch) < PITCH_LIMIT) {
+        const right = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
+        const pitchQ = new THREE.Quaternion().setFromAxisAngle(right, -dy * LOOK_SPEED);
+        camera.quaternion.premultiply(pitchQ);
+        _pitch = newPitch;
+    }
+    camera.quaternion.normalize();
+});
+
+const controls = {
+    update: () => {},
+    target: _lookTarget,
+};
+
+// Separate scene for geometry outlines
+const outlineScene   = new THREE.Scene();
+let   outlineObjects = [];
+
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ══════════════════════════════════════════════════════════
+//  GAUSSIAN SPLATS 3D
+// ══════════════════════════════════════════════════════════
+// One Viewer per room — the render loop only calls the active one.
+
+let GS3D_MODULE     = null;
+const gsViewers     = {};
+const splatLoaded   = {};
+let   splatLoadLock = false;
+
+// ══════════════════════════════════════════════════════════
+//  VIEWER STATE
+// ══════════════════════════════════════════════════════════
+let currentRoomId         = null;
+let constraintsOn         = true;
+let showSplat             = true;
+let showAllSplats         = false;
+let showOutlines          = false;
+let isTransitioning       = false;
+let justTransitioned      = false;
+let transitionCooldownEnd = 0;
+
+// ══════════════════════════════════════════════════════════
+//  MATH / TRANSFORM HELPERS
+// ══════════════════════════════════════════════════════════
+
+function mat4(arr) {
+    const m = new THREE.Matrix4();
+    m.set(
+        arr[0][0], arr[0][1], arr[0][2], arr[0][3],
+        arr[1][0], arr[1][1], arr[1][2], arr[1][3],
+        arr[2][0], arr[2][1], arr[2][2], arr[2][3],
+        arr[3][0], arr[3][1], arr[3][2], arr[3][3]
+    );
+    return m;
+}
+
+/**
+ * COLMAP XYZ to floor-plan XYZ.
+ *   First apply axis permutation, then 4x4 transformation matrix
+ */
+function colmapToFP(v, roomId) {
+    const tf = roomById[roomId]?.transform;
+    if (!tf) return v.clone();
+    const p = tf.perm, c = [v.x, v.y, v.z];
+    return new THREE.Vector3(c[p[0]], c[p[1]], c[p[2]]).applyMatrix4(mat4(tf.matrix));
+}
+
+/**
+ * Inverse of above.
+ */
+function fpToColmap(v, roomId) {
+    const tf = roomById[roomId]?.transform;
+    if (!tf) return v.clone();
+    const Minv = mat4(tf.matrix).invert();
+    const pv   = v.clone().applyMatrix4(Minv);
+    const p = tf.perm, pm = [pv.x, pv.y, pv.z], r = [0, 0, 0];
+    r[p[0]] = pm[0]; r[p[1]] = pm[1]; r[p[2]] = pm[2];
+    return new THREE.Vector3(r[0], r[1], r[2]);
+}
+
+/**
+ * Finds the "Up" direction in a splat scene.
+ * Using known floor plan "Up" (0,0,1), invert and apply only the rotate/scale (upper left, 3x3) portion of the transformation matrix
+ *  */
+function roomUp(roomId) {
+    const tf = roomById[roomId]?.transform;
+    if (!tf) return new THREE.Vector3(0, 1, 0);
+    const Minv  = mat4(tf.matrix).invert();
+    const m3inv = new THREE.Matrix3().setFromMatrix4(Minv);
+    const upPerm = new THREE.Vector3(0, 0, 1).applyMatrix3(m3inv).normalize();
+    const p = tf.perm, pm = [upPerm.x, upPerm.y, upPerm.z], r = [0, 0, 0];
+    r[p[0]] = pm[0]; r[p[1]] = pm[1]; r[p[2]] = pm[2];
+    return new THREE.Vector3(r[0], r[1], r[2]).normalize();
+}
+
+// ══════════════════════════════════════════════════════════
+//  POLYGON HELPERS
+// ══════════════════════════════════════════════════════════
+
+/** Signed area (positive = CCW). */
+function polyArea(pts) {
+    let a = 0, n = pts.length;
+    for (let i = 0, j = n-1; i < n; j = i++)
+        a += pts[j].x * pts[i].y - pts[i].x * pts[j].y;
+    return a * 0.5;
+}
+
+/** Ensure polygon is CCW (positive area). */
+function ensureCCW(pts) { return polyArea(pts) < 0 ? [...pts].reverse() : pts; }
+
+/**
+ * Create buffered polygons:
+ *   dist > 0 → expand outward (CCW polygon: right-hand side of each edge)
+ *   dist < 0 → shrink inward
+ * 3 consecutive points form a corner with two edges
+ * Offset each edge by dist * normal.
+ * Intersection of edges is the new vertex point - calculated by determinant.
+ */
+function offsetPoly(pts, dist) {
+    const n = pts.length, out = [];
+    for (let i = 0; i < n; i++) {
+        const a = pts[(i-1+n)%n], b = pts[i], c = pts[(i+1)%n];
+        const dx1 = b.x-a.x, dy1 = b.y-a.y, l1 = Math.hypot(dx1,dy1)||1e-12;
+        const nx1 =  dy1/l1, ny1 = -dx1/l1;   // right (outward) normal
+        const dx2 = c.x-b.x, dy2 = c.y-b.y, l2 = Math.hypot(dx2,dy2)||1e-12;
+        const nx2 =  dy2/l2, ny2 = -dx2/l2;
+        // Offset start-points of the two edges meeting at b
+        const a1x = a.x+nx1*dist, a1y = a.y+ny1*dist;
+        const a2x = b.x+nx2*dist, a2y = b.y+ny2*dist;
+        // Intersect the two offset lines
+        const den = dx1*dy2 - dy1*dx2;
+        if (Math.abs(den) < 1e-12) {
+            out.push({ x: b.x+nx1*dist, y: b.y+ny1*dist });
+        } else {
+            const t = ((a2x-a1x)*dy2 - (a2y-a1y)*dx2) / den; // Cramer's rule
+            out.push({ x: a1x+t*dx1, y: a1y+t*dy1 });
+        }
+    }
+    return out;
+}
+
+/** Ray-casting 2D point-in-polygon. */
+function pip(pts, px, py) {
+    let inside = false, n = pts.length;
+    for (let i = 0, j = n-1; i < n; j = i++) {
+        const xi=pts[i].x, yi=pts[i].y, xj=pts[j].x, yj=pts[j].y;
+        if (((yi>py) !== (yj>py)) // Check if edge intersects the ray
+            && px < (xj-xi)*(py-yi)/(yj-yi)+xi) // Check if ray crosses the edge
+            inside = !inside;
+    }
+    return inside;
+}
+
+/** Project point to nearest polygon edge.
+ * Used when outside geometric bounds. */
+function clampPoly(pts, px, py) {
+    if (pip(pts, px, py)) return { x: px, y: py };
+    let best = { x: px, y: py }, bestD = Infinity, n = pts.length;
+    for (let i = 0, j = n-1; i < n; j = i++) {
+        const ax=pts[j].x, ay=pts[j].y, bx=pts[i].x, by=pts[i].y;
+        const dx=bx-ax, dy=by-ay, d2=dx*dx+dy*dy;
+        const t = d2 < 1e-12 ? 0 : Math.max(0, Math.min(1, ((px-ax)*dx+(py-ay)*dy)/d2));
+        const cx=ax+t*dx, cy=ay+t*dy, dd=Math.hypot(px-cx,py-cy);
+        if (dd < bestD) { bestD=dd; best={x:cx,y:cy}; }
+    }
+    return best;
+}
+
+/** Extract CCW floor polygon from the PolygonZ. */
+function geomToPts(geomJson) {
+    if (!geomJson?.coordinates?.[0]) return [];
+    return ensureCCW(geomJson.coordinates[0].slice(0,-1).map(([x,y]) => ({x,y})));
+}
+
+// ══════════════════════════════════════════════════════════
+//  TOPOLOGY
+// ══════════════════════════════════════════════════════════
+
+function buildTopology(data) {
+    for (const r of data.rooms)   roomById[r.id]  = r;
+    for (const s of data.states)  stateById[s.id] = s;
+    for (const r of data.rooms) {
+        if (SPLAT_TYPES.has(r.cell_type)) roomToDoors[r.id] = [];
+    }
+    // Build door to room adjacency from transitions (based on the 3-point structure).
+    for (const t of data.transitions) {
+        const fr = roomById[t.from_room], tr = roomById[t.to_room];
+        if (!fr || !tr) continue;
+        const frD = fr.cell_type === 'ConnectionSpace';
+        const trD = tr.cell_type === 'ConnectionSpace';
+        const frS = SPLAT_TYPES.has(fr.cell_type);
+        const trS = SPLAT_TYPES.has(tr.cell_type);
+        if (frD && trS) { (doorRoomMap[fr.id] ??= new Set()).add(tr.id); }
+        if (trD && frS) { (doorRoomMap[tr.id] ??= new Set()).add(fr.id); }
+    }
+    for (const [dId, rooms] of Object.entries(doorRoomMap)) {
+        doorRoomMap[dId] = [...rooms];
+        for (const rId of doorRoomMap[dId])
+            if (roomToDoors[rId]) roomToDoors[rId].push(dId);
+    }
+}
+
+// ══════════════════════════════════════════════════════════
+//  GEOMETRY PRE-COMPUTATION
+// ══════════════════════════════════════════════════════════
+
+// Creates the buffered geometry which serve as the constraints.
+function precomputeGeometry(rooms) {
+    for (const room of rooms) {
+        if (!room.geom) continue;
+        const raw = geomToPts(room.geom);
+        if (raw.length < 3) continue;
+        const isDoor   = room.cell_type === 'ConnectionSpace';
+        const buf      = isDoor ? DOOR_OUT_M : -ROOM_INSET_M;
+        const buffered = offsetPoly(raw, buf);
+        roomGeom[room.id] = { raw, buffered, height: room.height ?? 3.0 };
+    }
+}
+
+// ══════════════════════════════════════════════════════════
+//  GEOMETRY OUTLINES 
+// ══════════════════════════════════════════════════════════
+
+function buildOutlines(refRoomId) {
+    for (const o of outlineObjects) outlineScene.remove(o);
+    outlineObjects = [];
+    const refRoom = roomById[refRoomId];
+    if (!refRoom?.transform) return;
+
+    for (const room of Object.values(roomById)) {
+        const rg = roomGeom[room.id];
+        if (!rg) continue;
+        const isDoor    = room.cell_type === 'ConnectionSpace';
+        const isCurrent = room.id === refRoomId;
+
+        // Colour scheme: current=blue, doors=orange, other rooms=teal
+        const color = isDoor ? 0xff8833 : (isCurrent ? 0x44aaff : 0x33aa77);
+        const lineMat = new THREE.LineBasicMaterial({
+            color, depthTest: false, depthWrite: false,
+            transparent: true, opacity: isCurrent ? 0.95 : 0.65,
+        });
+
+        const pts = rg.buffered, h = rg.height, n = pts.length;
+
+        // Transform each corner to COLMAP space of refRoom
+        // Extrude before transforming: build floor & ceiling in FP, then convert
+        const floorC = pts.map(p => fpToColmap(new THREE.Vector3(p.x, p.y, 0.0), refRoomId));
+        const ceilC  = pts.map(p => fpToColmap(new THREE.Vector3(p.x, p.y, h  ), refRoomId));
+
+        const verts = [];
+        const pushSeg = (a, b) => verts.push(a.x,a.y,a.z, b.x,b.y,b.z);
+
+        // Floor ring
+        for (let i=0;i<n;i++) pushSeg(floorC[i], floorC[(i+1)%n]);
+        // Ceiling ring
+        for (let i=0;i<n;i++) pushSeg(ceilC[i],  ceilC[(i+1)%n]);
+        // Vertical edges
+        for (let i=0;i<n;i++) pushSeg(floorC[i], ceilC[i]);
+
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+        const lines = new THREE.LineSegments(geo, lineMat);
+        lines.renderOrder = 999;
+        outlineScene.add(lines);
+        outlineObjects.push(lines);
+    }
+}
+
+// ══════════════════════════════════════════════════════════
+//  GAUSSIAN SPLATS 3D  –  INIT & SCENE MANAGEMENT
+// ══════════════════════════════════════════════════════════
+
+async function initGSModule() {
+    if (GS3D_MODULE) return true;
+    const CDN = 'https://cdn.jsdelivr.net/npm/@mkkellogg/gaussian-splats-3d@0.4.2/build/gaussian-splats-3d.module.js';
+    try {
+        GS3D_MODULE = await import(CDN);
+        console.info('[GS3D] module loaded');
+        return true;
+    } catch(e) {
+        console.error('[GS3D] failed to load:', e.message);
+        return false;
+    }
+}
+
+/**
+ * Create a dedicated GS3D Viewer for one room and load its splat.
+ * Inactive viewers are not called for update/render.
+ */
+async function loadRoomSplat(roomId, isPriority = false) {
+    if (!GS3D_MODULE || splatLoaded[roomId]) return;
+    const room = roomById[roomId];
+    if (!room?.file_path) { console.warn(`[splat] no file_path for ${roomId}`); return; }
+
+    if (splatLoadLock) {
+        if (!isPriority) return;
+        await new Promise(resolve => {
+            const t = setInterval(() => { if (!splatLoadLock) { clearInterval(t); resolve(); } }, 50);
+            setTimeout(() => { clearInterval(t); resolve(); }, 10000);
+        });
+        if (splatLoaded[roomId]) return;
+    }
+
+    splatLoadLock = true;
+    try {
+        $loadingMsg.textContent = `Loading: ${room.room_name}…`;
+
+        const viewer = new GS3D_MODULE.Viewer({
+            selfDrivenMode:     false,
+            useBuiltInControls: false,
+            renderer,
+            camera,
+            dynamicScene:       false,
+            logLevel:           GS3D_MODULE.LogLevel?.None ?? 0,
+        });
+
+        await viewer.addSplatScene('/' + room.file_path, {
+            splatAlphaRemovalThreshold: 5,
+            showLoadingUI: false,
+        });
+
+        gsViewers[roomId]   = viewer;
+        splatLoaded[roomId] = true;
+        console.info(`[splat] viewer ready for ${room.room_name}`);
+    } catch(e) {
+        console.error(`[splat] failed ${room.file_path}:`, e);
+    } finally {
+        splatLoadLock = false;
+    }
+}
+
+// ══════════════════════════════════════════════════════════
+//  CAMERA PLACEMENT IN A ROOM
+// ══════════════════════════════════════════════════════════
+
+/**
+ * Returns the midpoint of the door's floor edge that falls within the destination room. 
+ * Buffered polygon is used so midpoint is 0.6m inside the room.
+ * This prevents viewing wall/door Gaussians from behind.
+ * For each face of the door, a point-in-polygon test is performed with its midpoint, against the room's floor polygon.
+ */
+function doorEntryFace(doorId, destRoomId) {
+    const dg = roomGeom[doorId];
+    const rg = roomGeom[destRoomId];
+    if (!dg || !rg) return null;
+
+    const poly = dg.buffered;
+    const n    = poly.length;
+    const dcx  = poly.reduce((s,p) => s+p.x, 0) / n;
+    const dcy  = poly.reduce((s,p) => s+p.y, 0) / n;
+
+    for (let i = 0; i < n; i++) {
+        const a  = poly[i], b = poly[(i + 1) % n];
+        const ex = b.x - a.x,  ey = b.y - a.y;
+        const el = Math.hypot(ex, ey) || 1;
+        const mx = (a.x + b.x) * 0.5;
+        const my = (a.y + b.y) * 0.5;
+
+        // Outward normal for CCW ring: rotate edge 90° clockwise → (ey, -ex).
+        let nx = ey / el, ny = -ex / el;
+        if (nx * (mx - dcx) + ny * (my - dcy) < 0) { nx = -nx; ny = -ny; }
+
+        if (pip(rg.raw, mx, my)) return { midX: mx, midY: my, normalX: nx, normalY: ny };
+    }
+
+    const a = poly[0], b = poly[1];
+    const ex = b.x - a.x, ey = b.y - a.y, el = Math.hypot(ex, ey) || 1;
+    return { midX: (a.x+b.x)*0.5, midY: (a.y+b.y)*0.5,
+             normalX: ey/el,       normalY: -ex/el };
+}
+
+/**
+ * Place camera at eye height inside a room.
+ * Additional parameters used for transitions through a door (see below).
+ */
+function placeCamera(roomId, fpXY = null, doorId = null, carriedFwd = null, carriedPitch = 0) {
+    const rg = roomGeom[roomId];
+    let fwdFP = null;
+
+    // Door transition: camera XY position from entry face, camera direction carried over.
+    // The entry face midpoint is used for position.
+    // Direction uses the carried floor-plan forward if available; falls back to
+    // the face normal for the very first transition or if capture failed.
+    if (doorId) {
+        const face = doorEntryFace(doorId, roomId);
+        if (face) {
+            fpXY  = { x: face.midX, y: face.midY };
+            fwdFP = carriedFwd || { x: face.normalX, y: face.normalY };
+        }
+    } else if (carriedFwd) {
+        // Teleport with a carried direction
+        fwdFP = carriedFwd;
+    }
+
+    // Fallback XY: room centroid (teleports)
+    if (!fpXY && rg) {
+        const pts = rg.buffered;
+        fpXY = {
+            x: pts.reduce((s,p) => s+p.x, 0) / pts.length,
+            y: pts.reduce((s,p) => s+p.y, 0) / pts.length,
+        };
+    }
+    if (!fpXY) fpXY = { x: 0, y: 0 };
+
+    const up     = roomUp(roomId);
+    const eyeFP  = new THREE.Vector3(fpXY.x, fpXY.y, EYE_H);
+    const eyePos = fpToColmap(eyeFP, roomId);
+
+    // Fallback facing: project world −Z onto floor plane
+    if (!fwdFP) {
+        const worldFwd = new THREE.Vector3(0, 0, -1);
+        const fwdC = worldFwd.clone().addScaledVector(up, -worldFwd.dot(up)).normalize();
+        if (fwdC.lengthSq() < 0.1) fwdC.set(1, 0, 0);
+        const fpTip  = colmapToFP(fwdC.clone().add(camera.position), roomId);
+        const fpBase = colmapToFP(camera.position.clone(), roomId);
+        const dx = fpTip.x - fpBase.x, dy = fpTip.y - fpBase.y;
+        const len = Math.hypot(dx, dy) || 1;
+        fwdFP = { x: dx/len, y: dy/len };
+    }
+
+    // Set position and horizontal orientation.
+    const lookFP  = new THREE.Vector3(fpXY.x + fwdFP.x * 1.5, fpXY.y + fwdFP.y * 1.5, EYE_H);
+    const lookAtC = fpToColmap(lookFP, roomId);
+    camera.up.copy(up);
+    camera.position.copy(eyePos);
+    _lookTarget.copy(lookAtC);
+    camera.lookAt(_lookTarget);   // establishes horizontal baseline quaternion
+
+    // Pitch angle carried over
+    if (carriedPitch !== 0) {
+        const right = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
+        const pitchQ = new THREE.Quaternion().setFromAxisAngle(right, carriedPitch);
+        camera.quaternion.premultiply(pitchQ);
+        camera.quaternion.normalize();
+        const fwdDir = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+        _lookTarget.copy(camera.position).addScaledVector(fwdDir, 1.0);
+    }
+    _pitch = carriedPitch;
+}
+
+// ══════════════════════════════════════════════════════════
+//  ROOM TRANSITION
+// ══════════════════════════════════════════════════════════
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function transitionToRoom(newRoomId, camPosColmap = null, isTeleport = false, doorId = null) {
+    if (isTransitioning || newRoomId === currentRoomId) return;
+    isTransitioning = true;
+    const prevId = currentRoomId;
+
+    // When transitioning through door:
+    // Place camera position at door edge midpoint.
+    // Preserve camera horizontal view direction and pitch angle.
+
+    // When teleporting (via click on cell):
+    // Place camera position at Room centroid.
+    // Use default camera directions.
+
+    let carriedFwd   = null;   // {x, y} unit vector in floor-plan XY
+    let carriedPitch = 0;
+    if (!isTeleport && prevId && roomById[prevId]?.transform) {
+        // Extract forward from quaternion, project onto the room's floor plane
+        // to get the horizontal component only (ignore current pitch for yaw).
+        const fwdC = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+        const up   = roomUp(prevId);
+        fwdC.addScaledVector(up, -fwdC.dot(up));   // remove up component
+        if (fwdC.lengthSq() > 1e-4) {
+            fwdC.normalize();
+            // Convert direction to floor-plan by differencing two transformed points
+            const fpTip  = colmapToFP(camera.position.clone().add(fwdC), prevId);
+            const fpBase = colmapToFP(camera.position.clone(), prevId);
+            const dx = fpTip.x - fpBase.x, dy = fpTip.y - fpBase.y;
+            const len = Math.hypot(dx, dy);
+            if (len > 1e-4) carriedFwd = { x: dx / len, y: dy / len };
+        }
+        carriedPitch = _pitch;
+    }
+
+    $fade.style.opacity = '1';
+    await sleep(80);
+
+    if (GS3D_MODULE && !splatLoaded[newRoomId]) {
+        $loading.style.display = 'flex';
+        await loadRoomSplat(newRoomId, true);  
+        $loading.style.display = 'none';
+    }
+
+    // Compute new camera position: prevRoom COLMAP to floor-plan to newRoom COLMAP
+    let fpXY = null;
+    if (camPosColmap && prevId && roomById[prevId]?.transform && roomById[newRoomId]?.transform) {
+        const fp = colmapToFP(camPosColmap, prevId);
+        fpXY = { x: fp.x, y: fp.y };
+    }
+
+    currentRoomId = newRoomId;
+
+    placeCamera(newRoomId, fpXY, isTeleport ? null : doorId, carriedFwd, carriedPitch);
+    buildOutlines(newRoomId);   // rebuild outlines based on active room's transformation matrix
+    updateHUD();
+
+    justTransitioned      = !isTeleport;
+    transitionCooldownEnd = isTeleport ? 0 : performance.now() + 3000;
+
+    $fade.style.opacity = '0';
+    await sleep(40);
+    isTransitioning = false;
+}
+
+async function teleportToRoom(roomId) {
+    if (roomId === currentRoomId || isTransitioning) return;
+    await transitionToRoom(roomId, null, true);
+}
+
+// ══════════════════════════════════════════════════════════
+//  CAMERA CONSTRAINTS
+// ══════════════════════════════════════════════════════════
+
+function enforceConstraints() {
+    if (!constraintsOn || !currentRoomId || isTransitioning) return;
+
+    const room = roomById[currentRoomId];
+    const rg   = roomGeom[currentRoomId];
+    if (!room?.transform || !rg) return;
+
+    // Camera in floor-plan space
+    const fp   = colmapToFP(camera.position, currentRoomId);
+    const fpX  = fp.x, fpY = fp.y, fpZ = fp.z;
+
+    // Prevent transition again if camera is still within/touching door polygon.
+    if (justTransitioned) {
+        const doors = roomToDoors[currentRoomId] || [];
+        const stillInADoor = doors.some(doorId => {
+            const dg = roomGeom[doorId];
+            return dg && pip(dg.buffered, fpX, fpY);
+        });
+        if (stillInADoor) return;
+        justTransitioned = false;
+    }
+
+    // Additional 3s timer to prevent immediate re-transitions.
+    if (performance.now() < transitionCooldownEnd) {
+    } else {
+        for (const doorId of (roomToDoors[currentRoomId] || [])) {
+            const dg = roomGeom[doorId];
+            if (!dg) continue;
+            if (pip(dg.buffered, fpX, fpY)) {
+                const others = (doorRoomMap[doorId] || []).filter(r => r !== currentRoomId);
+                if (others.length > 0) {
+                    transitionToRoom(others[0], camera.position.clone(), false, doorId);
+                    return;
+                }
+            }
+        }
+    } 
+
+    // Horizontal check
+    const inRoom = pip(rg.buffered, fpX, fpY);
+    let inDoor = false;
+    if (!inRoom) {
+        for (const doorId of (roomToDoors[currentRoomId] || [])) {
+            const dg = roomGeom[doorId];
+            if (dg && pip(dg.buffered, fpX, fpY)) { inDoor = true; break; }
+        }
+    }
+    if (!inRoom && !inDoor) {
+        const clamped = clampPoly(rg.buffered, fpX, fpY);
+        const newC    = fpToColmap(new THREE.Vector3(clamped.x, clamped.y, fpZ), currentRoomId); // Move camera to within nearest plane.
+        const delta   = newC.clone().sub(camera.position);
+        camera.position.copy(newC);
+        controls.target.add(delta);
+    }
+
+    // Vertical check
+    const minZ = 0.05, maxZ = rg.height - 0.05;
+    if (fpZ < minZ || fpZ > maxZ) {
+        const clampedZ = Math.max(minZ, Math.min(maxZ, fpZ));
+        const newC     = fpToColmap(new THREE.Vector3(fpX, fpY, clampedZ), currentRoomId);
+        const delta    = newC.clone().sub(camera.position);
+        camera.position.copy(newC);
+        controls.target.add(delta);
+    }
+}
+
+// ══════════════════════════════════════════════════════════
+//  WASD MOVEMENT
+// ══════════════════════════════════════════════════════════
+
+const keys = {};
+window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if (e.code === 'Space') e.preventDefault();   // stop page scroll
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+function applyWASD(dt) {
+    if (!Object.values(keys).some(Boolean)) return;
+    const up    = roomUp(currentRoomId);
+    const fwd   = new THREE.Vector3();
+    camera.getWorldDirection(fwd);
+    fwd.addScaledVector(up, -fwd.dot(up)).normalize();
+    if (fwd.lengthSq() < 0.01) fwd.set(1,0,0);
+
+    const right = new THREE.Vector3().crossVectors(fwd, up).normalize();
+    const spd   = MOVE_SPD * dt;
+    const move  = new THREE.Vector3();
+
+    if (keys['KeyW'] || keys['ArrowUp'])    move.addScaledVector(fwd,   spd);
+    if (keys['KeyS'] || keys['ArrowDown'])  move.addScaledVector(fwd,  -spd);
+    if (keys['KeyA'] || keys['ArrowLeft'])  move.addScaledVector(right, -spd);
+    if (keys['KeyD'] || keys['ArrowRight']) move.addScaledVector(right,  spd);
+    if (keys['Space'])                      move.addScaledVector(up,    spd);   // up
+    if (keys['ShiftLeft'] || keys['ShiftRight']) move.addScaledVector(up, -spd); // down
+
+    if (move.lengthSq() < 1e-12) return;
+    camera.position.add(move);
+    _lookTarget.add(move);
+}
+
+// ══════════════════════════════════════════════════════════
+//  MINIMAP
+// ══════════════════════════════════════════════════════════
+
+const MM_W = 280, MM_H = 210;
+const mmCtx = $mmCv.getContext('2d');
+let mmScale = 1, mmOX = 0, mmOY = 0;
+const tpBtns = []; 
+
+function initMinimap() {
+    let mnX=Infinity, mnY=Infinity, mxX=-Infinity, mxY=-Infinity;
+    for (const rg of Object.values(roomGeom)) {
+        for (const p of rg.raw) {
+            mnX=Math.min(mnX,p.x); mnY=Math.min(mnY,p.y);
+            mxX=Math.max(mxX,p.x); mxY=Math.max(mxY,p.y);
+        }
+    }
+    const pad=18, fpW=mxX-mnX||1, fpH=mxY-mnY||1;
+    mmScale = Math.min((MM_W-2*pad)/fpW, (MM_H-2*pad)/fpH);
+    mmOX    = pad - mnX * mmScale;
+    mmOY    = pad - mnY * mmScale;
+}
+
+function mm(x, y) {
+    return { mx: x*mmScale + mmOX, my: MM_H - (y*mmScale + mmOY) };
+}
+
+function updateMinimap() {
+    mmCtx.clearRect(0, 0, MM_W, MM_H);
+    tpBtns.length = 0;
+
+    for (const [rid, rg] of Object.entries(roomGeom)) {
+        const room     = roomById[rid];
+        const isDoor   = room.cell_type === 'ConnectionSpace';
+        const isCur    = rid === currentRoomId;
+
+        // Draw polygon
+        mmCtx.beginPath();
+        const p0 = mm(rg.raw[0].x, rg.raw[0].y);
+        mmCtx.moveTo(p0.mx, p0.my);
+        for (const p of rg.raw.slice(1)) { const mp=mm(p.x,p.y); mmCtx.lineTo(mp.mx,mp.my); }
+        mmCtx.closePath();
+        mmCtx.fillStyle   = isDoor ? 'rgba(255,130,40,.15)' : isCur ? 'rgba(50,110,255,.28)' : 'rgba(35,55,110,.20)';
+        mmCtx.strokeStyle = isDoor ? 'rgba(255,150,60,.60)' : isCur ? 'rgba(70,150,255,.90)' : 'rgba(70,100,200,.50)';
+        mmCtx.lineWidth   = isCur ? 1.5 : 0.8;
+        mmCtx.fill();
+        mmCtx.stroke();
+
+        if (!isDoor) {
+            // Centroid label + teleport dot
+            const cx = rg.raw.reduce((s,p)=>s+p.x,0)/rg.raw.length;
+            const cy = rg.raw.reduce((s,p)=>s+p.y,0)/rg.raw.length;
+            const mc = mm(cx, cy);
+
+            mmCtx.font      = '9px monospace';
+            mmCtx.textAlign = 'center';
+            mmCtx.fillStyle = isCur ? '#88ccff' : 'rgba(160,185,255,.65)';
+            mmCtx.fillText(room.room_name || rid, mc.mx, mc.my - 8);
+
+            mmCtx.beginPath();
+            mmCtx.arc(mc.mx, mc.my+2, 5, 0, Math.PI*2);
+            mmCtx.fillStyle   = isCur ? '#3380ee' : 'rgba(50,80,180,.82)';
+            mmCtx.strokeStyle = isCur ? '#88ccff' : '#6688cc';
+            mmCtx.lineWidth = 1.2;
+            mmCtx.fill(); mmCtx.stroke();
+            tpBtns.push({ roomId: rid, mx: mc.mx, my: mc.my+2, r: 9 });
+        }
+    }
+
+    // Camera dot + direction arrow
+    if (currentRoomId && roomById[currentRoomId]?.transform) {
+        const fp   = colmapToFP(camera.position, currentRoomId);
+        const mc   = mm(fp.x, fp.y);
+        // Direction
+        const fwd  = new THREE.Vector3();
+        camera.getWorldDirection(fwd);
+        const fpF  = colmapToFP(camera.position.clone().add(fwd.multiplyScalar(1.0)), currentRoomId);
+        const mf   = mm(fpF.x, fpF.y);
+        mmCtx.beginPath();
+        mmCtx.moveTo(mc.mx, mc.my);
+        mmCtx.lineTo(mf.mx, mf.my);
+        mmCtx.strokeStyle = 'rgba(255,255,255,.55)';
+        mmCtx.lineWidth = 1.5;
+        mmCtx.stroke();
+        // Dot
+        mmCtx.beginPath();
+        mmCtx.arc(mc.mx, mc.my, 4, 0, Math.PI*2);
+        mmCtx.fillStyle = '#ffffff';
+        mmCtx.fill();
+    }
+}
+
+$mmCv.addEventListener('click', async e => {
+    const rect = $mmCv.getBoundingClientRect();
+    const sx   = $mmCv.width  / rect.width;
+    const sy   = $mmCv.height / rect.height;
+    const mx   = (e.clientX - rect.left) * sx;
+    const my   = (e.clientY - rect.top)  * sy;
+    for (const b of tpBtns) {
+        if (Math.hypot(mx-b.mx, my-b.my) <= b.r) {
+            await teleportToRoom(b.roomId); break;
+        }
+    }
+});
+
+// ══════════════════════════════════════════════════════════
+//  HUD
+// ══════════════════════════════════════════════════════════
+
+function updateHUD() {
+    const room = roomById[currentRoomId];
+    $hudRoom.textContent = `Room: ${room?.room_name ?? '—'}  [${currentRoomId ?? '—'}  ${room?.cell_type ?? ''}]`;
+    const p = camera.position;
+    $hudPos.textContent  = `COLMAP pos: (${p.x.toFixed(3)}, ${p.y.toFixed(3)}, ${p.z.toFixed(3)})`;
+    if (currentRoomId && room?.transform) {
+        const fp = colmapToFP(camera.position, currentRoomId);
+        $hudFP.textContent = `Floor-plan: (${fp.x.toFixed(2)}, ${fp.y.toFixed(2)}, ${fp.z.toFixed(2)}) m`;
+    }
+}
+
+// ══════════════════════════════════════════════════════════
+//  BUTTONS
+// ══════════════════════════════════════════════════════════
+
+$btnOutlines.addEventListener('click', () => {
+    showOutlines = !showOutlines;
+    $btnOutlines.classList.toggle('on', showOutlines);
+});
+
+$btnSplat.addEventListener('click', () => {
+    showSplat = !showSplat;
+    $btnSplat.classList.toggle('on', showSplat);
+    // If turning splat back on while showAllSplats is active, keep that mode
+});
+
+$btnAllSplats.addEventListener('click', () => {
+    showAllSplats = !showAllSplats;
+    $btnAllSplats.classList.toggle('on', showAllSplats);
+    if (!showAllSplats) {
+        // Returning to single-room mode: ensure only current room shows
+        $btnSplat.classList.toggle('on', showSplat);
+    }
+});
+
+$btnLock.addEventListener('click', () => {
+    constraintsOn = !constraintsOn;
+    $btnLock.textContent = constraintsOn ? '⊠ Constraints ON' : '⊡ Constraints OFF';
+    $btnLock.classList.toggle('on', constraintsOn);
+});
+
+// ══════════════════════════════════════════════════════════
+//  BACKGROUND PRELOADER
+// ══════════════════════════════════════════════════════════
+
+async function preloadAllRooms(skipId) {
+    const queue = Object.values(roomById)
+        .filter(r => SPLAT_TYPES.has(r.cell_type) && r.file_path && r.id !== skipId);
+    for (const room of queue) {
+        if (!splatLoaded[room.id]) {
+            // isPriority=false: yields if a user-triggered priority load starts
+            await loadRoomSplat(room.id, false);
+            // Small yield between loads so the render loop stays responsive
+            await new Promise(r => setTimeout(r, 50));
+        }
+    }
+    console.info('[splat] all rooms preloaded');
+}
+
+
+// ══════════════════════════════════════════════════════════
+//  RENDER LOOP
+// ══════════════════════════════════════════════════════════
+
+let lastT = performance.now();
+let frame = 0;
+
+let fpsFrameCount = 0;
+let fpsWindowStart = performance.now();
+let fpsDisplay = 0;
+
+function animate() {
+    requestAnimationFrame(animate);
+    const now = performance.now();
+    const dt  = Math.min((now - lastT) * 0.001, 0.1);
+    lastT = now;
+    frame++;
+    fpsFrameCount++;
+
+
+    const fpsElapsed = now - fpsWindowStart;
+    if (fpsElapsed >= 500) {
+        fpsDisplay = Math.round(fpsFrameCount / (fpsElapsed / 1000));
+        fpsFrameCount  = 0;
+        fpsWindowStart = now;
+        const colour = fpsDisplay >= 50 ? '#44dd88' : fpsDisplay >= 30 ? '#ffcc44' : '#ff5555';
+        $hudFPS.textContent = `FPS: ${fpsDisplay}`;
+        $hudFPS.style.color = colour;
+    }
+
+    applyWASD(dt);
+    controls.update();
+    enforceConstraints();
+
+    renderer.autoClear = true;
+    if (showSplat && showAllSplats) {
+        renderer.autoClear = true;
+        for (const [rid, v] of Object.entries(gsViewers)) {
+            v.update();
+            v.render();
+            renderer.autoClear = false; t
+        }
+        renderer.autoClear = true;
+    } else {
+    const activeViewer = gsViewers[currentRoomId];
+    if (showSplat && activeViewer) {
+        activeViewer.update();
+        activeViewer.render();
+    } else {
+        renderer.setClearColor(0x000408, 1);
+        renderer.clear();
+    }
+
+    }
+
+    if (showOutlines && outlineObjects.length > 0) {
+        renderer.autoClear = false;
+        renderer.render(outlineScene, camera);
+        renderer.autoClear = true;
+    }
+
+    updateHUD();
+    if (frame % 2 === 0) updateMinimap();
+}
+
+// ══════════════════════════════════════════════════════════
+//  INIT
+// ══════════════════════════════════════════════════════════
+
+async function init() {
+    try {
+        // Fetch topology from PostGIS
+        $loadingMsg.textContent = 'Fetching scene data…';
+        const data = await fetch('/api/scene-data').then(r => { if(!r.ok) throw new Error(r.statusText); return r.json(); });
+
+        // Build topology & geometry
+        buildTopology(data);
+        precomputeGeometry(data.rooms);
+        initMinimap();
+
+        console.groupCollapsed('[IndoorGML] Topology');
+        for (const r of data.rooms) console.log(`  ${r.id}  ${r.room_name}  ${r.cell_type}  transform:${!!r.transform}`);
+        console.log('[doors→rooms]', doorRoomMap);
+        console.log('[rooms→doors]', roomToDoors);
+        console.groupEnd();
+
+        // Default startup render
+        const startRoom =
+            Object.values(roomById).find(r => r.room_name === '0470' && SPLAT_TYPES.has(r.cell_type)) ||
+            Object.values(roomById).find(r => SPLAT_TYPES.has(r.cell_type));
+        if (!startRoom) throw new Error('No splat room found in database.');
+
+        $loadingMsg.textContent = 'Loading 3DGS renderer…';
+        const gs3dOK = await initGSModule();
+
+        if (gs3dOK) {
+            $loadingMsg.textContent = `Loading splat: ${startRoom.room_name}…`;
+            await loadRoomSplat(startRoom.id, true);
+        } else {
+            $loadingMsg.textContent = '⚠ GS3D unavailable — geometry overlay only';
+            await sleep(1200);
+        }
+
+        currentRoomId = startRoom.id;
+
+        placeCamera(startRoom.id, null);
+
+        buildOutlines(startRoom.id);
+
+        $loading.style.display = 'none';
+        updateHUD();
+        updateMinimap();
+        animate();
+
+        // Pre-load other scenes in background
+        if (gs3dOK) preloadAllRooms(startRoom.id);
+
+    } catch (err) {
+        $loadingMsg.textContent = '✗ Error: ' + err.message;
+        console.error('[init error]', err);
+    }
+}
+
+init();
+</script>
+</body>
+</html>
