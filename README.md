@@ -14,8 +14,8 @@ This is the code repository for a MSc Geomatics thesis paper that proposes the u
 | PostgreSQL + PostGIS | Spatial topology database |
 
 Note: 
-- The base IndoorGML model that is ingested by indoorgml_to_postgis.py was manually created, using STEMLab's Ineditor (available at https://github.com/STEMLab/InEditor). 
-- InViewer-Desktop (https://github.com/STEMLab/InViewer-Desktop) may also be used for visualising the IndoorGML files.
+- The base IndoorGML model that is ingested by indoorgml_to_postgis.py was manually created, using STEMLab's [Ineditor](https://github.com/STEMLab/InEditor). 
+- [InViewer-Desktop](https://github.com/STEMLab/InViewer-Desktop) may also be used for visualising the IndoorGML files.
 - A reference floor plan was used to ensure metric accuracy for alignment purposes. see `data/floor_plan_data.json`
 
 ## Installation
@@ -53,6 +53,7 @@ The transformation matrix and axis permutation are then written into the PostGIS
 Note: Re-running `indoorgml_to_postgis.py` after this step will wipe the transformation matrix from the database.
 
 ### 6. Web Server Prototype
+For only the demonstration of the proof-of-concept, it is sufficient to start here.
 Note: First ensure that the 3DGS ply files are downloaded from the Release (at https://github.com/mjteo95/3dgs-topology/releases/tag/PLY-files), and placed in `code/src/static/splats/`.
 
 Run `server.py`.
