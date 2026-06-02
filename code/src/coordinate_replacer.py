@@ -5,7 +5,7 @@ from lxml import etree
 from pathlib import Path
 import numpy as np
 
-# ─── CONFIG ──────────────────────────────────────────────────────────────────
+# --- CONFIG ---
 
 DIRECTORY  = Path(__file__).resolve().parent.parent.parent
 INPUT_GML  = DIRECTORY /  "data" / "manual-bk.gml"
@@ -15,7 +15,7 @@ DATA_JSON  = DIRECTORY / "data" / "floor_plan_data.json"
 FLOOR_Z           = 0.0
 DXF_UNIT_TO_M     = 0.001   # DXF millimetres → metres; applied once in the loader
 
-# ─── NAMESPACES ──────────────────────────────────────────────────────────────
+# --- NAMESPACES ---
 
 NS = {
     "gml":   "http://www.opengis.net/gml/3.2",
