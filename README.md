@@ -53,6 +53,8 @@ The transformation matrix and axis permutation are then written into the PostGIS
 Note: Re-running `indoorgml_to_postgis.py` after this step will wipe the transformation matrix from the database.
 
 ### 6. Web Server Prototype
+Note: First ensure that the 3DGS ply files are downloaded from the Release (at https://github.com/mjteo95/3dgs-topology/releases/tag/PLY-files), and placed in `code/src/static/splats/`.
+
 Run `server.py`.
 Then open `http://localhost:8000` in a browser to launch the 3DGS viewer.
 
@@ -70,11 +72,10 @@ Then open `http://localhost:8000` in a browser to launch the 3DGS viewer.
 |------|-------------|
 | `data/floor_plan_data.json` | Room definitions (C1–C4) and DXF-to-sparse correspondence points |
 | `data/aligned-bk.gml` | IndoorGML model with aligned coordinates |
-| `data/aligned-bk-2.gml` | Alternative aligned IndoorGML model |
 | `data/manual-bk.gml` | Hand-authored IndoorGML model (source) |
-| `data/transformation_report.txt` | Alignment metrics (RMS errors, transformation matrices) |
+| `data/transformation_report.txt` | Alignment metrics |
 | `data/0470_synthetic_pc.ply` | Synthetic reference point cloud for room 0470 |
-| `code/src/static/splats/*.ply` | Pre-trained 3DGS point clouds (rooms 0450, 0470, 0807) |
+| `code/src/static/splats/*.ply` | 3DGS point clouds (rooms 0450, 0470, 0807) |
 
 ## Rooms
 
@@ -85,6 +86,8 @@ Three rooms are included in the dataset:
 | 0450 | ~80 MB |
 | 0470 | ~80 MB |
 | 0807 | ~125 MB |
+
+These are published as a Release (see https://github.com/mjteo95/3dgs-topology/releases/tag/PLY-files) due to file size constraints in the repository. Ensure these files are downloaded and placed in `code/src/static/splats/` in order for `server.py` to function.
 
 ## Project Structure
 
